@@ -50,6 +50,10 @@ to one specific IP address).
 package appnet
 
 import (
+	// For scanning the config file for the overlay_ip
+	"bufio"
+	"strings"
+
 	"context"
 	"fmt"
 	"net"
@@ -97,6 +101,17 @@ func Dial(address string) (*snet.Conn, error) {
 	raddr, err := ResolveUDPAddr(address)
 	if err != nil {
 		return nil, err
+	}
+	// Setting this according to example of what happens when communicating over localhost
+	//ip, _, err := net.ParseCIDR("9.0.0.1/32")
+	//if err != nil {
+	//	return nil, err
+	//}
+	raddr.NextHop = &net.UDPAddr{
+		//IP:   ip,
+		IP:   raddr.Host.IP,
+		Port: 30041,
+		Zone: "",
 	}
 	return DialAddr(raddr)
 }
@@ -232,14 +247,69 @@ func findDispatcher() (reliable.Dispatcher, error) {
 	return dispatcher, nil
 }
 
+func parseDispatcherSocketFromConfig() (string, bool, error) {
+	DEFAULT_PATH := "/etc/scion/gen/dispatcher/disp.toml"
+	file, err := os.Open(DEFAULT_PATH)
+	if err != nil {
+		return "", false, err
+	}
+	// Read file line by line
+	scanner := bufio.NewScanner(file)
+	scanner.Split(bufio.ScanLines)
+	var socket = ""
+	for scanner.Scan() {
+		// Find Socket
+		line := scanner.Text()
+		if strings.Contains(line, "application_socket") {
+			socket_start_idx := strings.Index(line, `"`) + 1
+			socket = line[socket_start_idx : len(line)-1]
+		}
+	}
+	if socket == "" {
+		// Return default socket if nothing is configured
+		socket = "/run/shm/dispatcher/default.sock"
+	}
+	return socket, true, nil
+}
+
+func parseLocalIPFromConfig() (string, bool, error) {
+	DEFAULT_PATH := "/etc/scion/gen/dispatcher/disp.toml"
+	file, err := os.Open(DEFAULT_PATH)
+	if err != nil {
+		return "", false, err
+	}
+	// Read file line by line
+	scanner := bufio.NewScanner(file)
+	scanner.Split(bufio.ScanLines)
+	var ip_str = ""
+	for scanner.Scan() {
+		// Find Socket
+		line := scanner.Text()
+		if strings.Contains(line, "overlay_ip") {
+			ip_start_idx := strings.Index(line, `"`) + 1
+			ip_str = line[ip_start_idx : len(line)-1]
+		}
+	}
+	ok := true
+	if ip_str == "" {
+		ok = false
+	}
+	return ip_str, ok, nil
+}
+
 func findDispatcherSocket() (string, error) {
-	path, ok := os.LookupEnv("SCION_DISPATCHER_SOCKET")
+	// Changed this function to use the configs file instead of environment variables
+	// path, ok := os.LookupEnv("SCION_DISPATCHER_SOCKET")
+	path, ok, err := parseDispatcherSocketFromConfig()
+	if err != nil {
+		return "parseDispatcherSocketFromConfig produced an error", err
+	}
 	if !ok {
 		path = reliable.DefaultDispPath
 	}
-	err := statSocket(path)
-	if err != nil {
-		return "", fmt.Errorf("error looking for SCION dispatcher socket at %s (override with SCION_DISPATCHER_SOCKET): %w", path, err)
+	err_1 := statSocket(path)
+	if err_1 != nil {
+		return "", fmt.Errorf("error looking for SCION dispatcher socket at %s (override with SCION_DISPATCHER_SOCKET): %w", path, err_1)
 	}
 	return path, nil
 }
@@ -261,6 +331,19 @@ func isSocket(mode os.FileMode) bool {
 
 // findAnyHostInLocalAS returns the IP address of some (infrastructure) host in the local AS.
 func findAnyHostInLocalAS(ctx context.Context, sciondConn sciond.Connector) (net.IP, error) {
+	// First check if config file of dispatcher specifies an overlay IP. If this is the case, return that one.
+	ip_str, ok, err := parseLocalIPFromConfig()
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		ip, _, err := net.ParseCIDR(ip_str + "/32")
+		if err != nil {
+			return nil, err
+		}
+		return ip, nil
+	}
+	// Otherwise, default behaviour.
 	addr, err := sciond.TopoQuerier{Connector: sciondConn}.OverlayAnycast(ctx, addr.SvcBS)
 	if err != nil {
 		return nil, err
